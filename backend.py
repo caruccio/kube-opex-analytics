@@ -14,6 +14,7 @@ import calendar
 import collections
 import enum
 import errno
+import fnmatch
 import json
 import logging
 import os
@@ -21,7 +22,7 @@ import sys
 import threading
 import time
 import traceback
-import urllib
+import urllib, urllib3
 from typing import Any, List
 
 import flask
@@ -38,6 +39,7 @@ from waitress import serve as waitress_serve
 
 import werkzeug.middleware.dispatcher as wsgi
 
+urllib3.disable_warnings()
 
 def create_directory_if_not_exists(path):
     try:
@@ -68,6 +70,8 @@ class Config:
     k8s_ssl_cacert = os.getenv('KOA_K8S_CACERT', None)
     k8s_ssl_client_cert = os.getenv('KOA_K8S_AUTH_CLIENT_CERT', 'NO_ENV_CLIENT_CERT')
     k8s_ssl_client_cert_key = os.getenv('KOA_K8S_AUTH_CLIENT_CERT_KEY', 'NO_ENV_CLIENT_CERT_CERT')
+    included_namespaces = [ i for i in os.getenv('KOA_INCLUDED_NAMESPACES', '').replace(' ','').split(',') if i ]
+    excluded_namespaces = [ i for i in os.getenv('KOA_EXCLUDED_NAMESPACES', '').replace(' ','').split(',') if i ]
 
     def __init__(self):
         self.load_rbac_auth_token()
@@ -96,6 +100,19 @@ class Config:
             self.koa_verify_ssl_option = self.k8s_ssl_cacert
         else:
             self.koa_verify_ssl_option = self.k8s_verify_ssl
+
+    @staticmethod
+    def match(items, pattern):
+        return any([ fnmatch.fnmatch(i, pattern) for i in items ])
+
+    @staticmethod
+    def allow_namespace(namespace):
+        if KOA_CONFIG.match(KOA_CONFIG.excluded_namespaces, namespace):
+            return False
+
+        return len(KOA_CONFIG.included_namespaces) == 0 or \
+                '*' in KOA_CONFIG.included_namespaces or \
+                KOA_CONFIG.match(KOA_CONFIG.included_namespaces, namespace)
 
     def load_rbac_auth_token(self):
         try:
@@ -156,6 +173,15 @@ PROMETHEUS_PERIODIC_USAGE_EXPORTERS = {
                                                           ['namespace', 'resource']),
     RrdPeriod.PERIOD_YEAR_SEC: prometheus_client.Gauge('koa_namespace_monthly_usage',
                                                        'Current monthly resource usage per namespace',
+                                                       ['namespace', 'resource'])
+}
+
+PROMETHEUS_PERIODIC_REQUESTS_EXPORTERS = {
+    RrdPeriod.PERIOD_14_DAYS_SEC: prometheus_client.Gauge('koa_namespace_daily_requests',
+                                                          'Current daily resource reservation per namespace',
+                                                          ['namespace', 'resource']),
+    RrdPeriod.PERIOD_YEAR_SEC: prometheus_client.Gauge('koa_namespace_monthly_requests',
+                                                       'Current monthly resource reservation per namespace',
                                                        ['namespace', 'resource'])
 }
 
@@ -335,8 +361,12 @@ class K8sUsage:
         for _, item in enumerate(data_json['items']):
             metadata = item.get('metadata', None)
             if metadata is not None:
+                if not KOA_CONFIG.allow_namespace(metadata.get('name')):
+                    continue
                 self.usageByNamespace[metadata.get('name')] = ResourceCapacities(cpu=0.0, mem=0.0)
                 self.requestByNamespace[metadata.get('name')] = ResourceCapacities(cpu=0.0, mem=0.0)
+
+        KOA_LOGGER.debug("Found namespaces: %s", ', '.join(self.usageByNamespace.keys()))
 
     def extract_nodes(self, data):
         # exit if not valid data
@@ -406,6 +436,9 @@ class K8sUsage:
         # process likely valid data
         data_json = json.loads(data)
         for _, item in enumerate(data_json['items']):
+            if not KOA_CONFIG.allow_namespace(item['metadata']['namespace']):
+                continue
+
             pod = Pod()
             pod.namespace = item['metadata']['namespace']
             pod.name = '%s.%s' % (item['metadata']['name'], pod.namespace)
@@ -435,6 +468,7 @@ class K8sUsage:
                 pod.nodeName = item['spec']['nodeName']
                 pod.cpuRequest = 0.0
                 pod.memRequest = 0.0
+                #TODO: extract initContainers
                 for _, container in enumerate(item.get('spec').get('containers')):
                     resources = container.get('resources', None)
                     if resources is not None:
@@ -452,6 +486,8 @@ class K8sUsage:
         # process likely valid data
         data_json = json.loads(data)
         for _, item in enumerate(data_json['items']):
+            if not KOA_CONFIG.allow_namespace(item['metadata']['namespace']):
+                continue
             pod_name = '%s.%s' % (item['metadata']['name'], item['metadata']['namespace'])
             pod = self.pods.get(pod_name, None)
             if pod is not None:
@@ -670,9 +706,16 @@ class Rrd:
         usage_export = collections.defaultdict(list)
         usage_per_type_date = {}
         sum_usage_per_type_date = {}
+        requests_export = collections.defaultdict(list)
+        requests_per_type_date = {}
+        sum_requests_per_type_date = {}
         for _, db in enumerate(dbfiles):
             rrd = Rrd(db_files_location=KOA_CONFIG.db_location, dbname=db)
             current_periodic_usage = rrd.dump_histogram_data(period=period)
+
+            rrd = Rrd(db_files_location=KOA_CONFIG.db_location, dbname=KOA_CONFIG.usage_efficiency_db(db))
+            current_periodic_rf = rrd.dump_histogram_data(period=period)
+
             for res in [ResUsageType.CPU, ResUsageType.MEMORY]:
                 for date_key, usage_value in current_periodic_usage[res].items():
                     if usage_value > 0.0:
@@ -682,10 +725,25 @@ class Rrd:
                             usage_per_type_date[res][date_key] = {}
                         usage_per_type_date[res][date_key][db] = usage_value
 
+                        if res not in requests_per_type_date:
+                            requests_per_type_date[res] = collections.defaultdict(lambda: 0.0)
+                        if date_key not in requests_per_type_date[res]:
+                            requests_per_type_date[res][date_key] = {}
+
+                        rf = current_periodic_rf[res][date_key]
+                        if rf > 0.0:
+                            requests_per_type_date[res][date_key][db] = usage_value / rf
+                        else:
+                            requests_per_type_date[res][date_key][db] = 0.0
+
                         if db != KOA_CONFIG.db_billing_hourly_rate:
                             if res not in sum_usage_per_type_date:
                                 sum_usage_per_type_date[res] = collections.defaultdict(lambda: 0.0)
                             sum_usage_per_type_date[res][date_key] += usage_value
+
+                            if res not in sum_requests_per_type_date:
+                                sum_requests_per_type_date[res] = collections.defaultdict(lambda: 0.0)
+                            sum_requests_per_type_date[res][date_key] += usage_value
 
         for res, usage_data_bundle in usage_per_type_date.items():
             for date_key, db_usage_item in usage_data_bundle.items():
@@ -704,10 +762,28 @@ class Rrd:
                             PROMETHEUS_PERIODIC_USAGE_EXPORTERS[period].labels(db, ResUsageType(res).name).set(
                                 usage_cost)
 
+                        requests_value = requests_per_type_date[res][date_key][db]
+                        requests_cost = round(requests_value, KOA_CONFIG.db_round_decimals)
+                        if KOA_CONFIG.cost_model == 'RATIO' or KOA_CONFIG.cost_model == 'CHARGE_BACK':
+                            requests_ratio = requests_value / sum_requests_per_type_date[res][date_key]
+                            requests_cost = round(100 * requests_ratio, KOA_CONFIG.db_round_decimals)
+                            if KOA_CONFIG.cost_model == 'CHARGE_BACK':
+                                requests_cost = round(
+                                    requests_ratio * usage_per_type_date[res][date_key][KOA_CONFIG.db_billing_hourly_rate],
+                                    KOA_CONFIG.db_round_decimals)
+                        requests_export[res].append('{"stack":"%s","requests":%f,"date":"%s"}' % (db, requests_cost, date_key))
+                        if Rrd.get_date_group(now_gmtime, period) == date_key:
+                            PROMETHEUS_PERIODIC_REQUESTS_EXPORTERS[period].labels(db, ResUsageType(res).name).set(
+                                requests_cost)
+
         with open(str('%s/cpu_usage_period_%d.json' % (KOA_CONFIG.frontend_data_location, period)), 'w') as fd:
             fd.write('[' + ','.join(usage_export[0]) + ']')
         with open(str('%s/memory_usage_period_%d.json' % (KOA_CONFIG.frontend_data_location, period)), 'w') as fd:
             fd.write('[' + ','.join(usage_export[1]) + ']')
+        with open(str('%s/cpu_requests_period_%d.json' % (KOA_CONFIG.frontend_data_location, period)), 'w') as fd:
+            fd.write('[' + ','.join(requests_export[0]) + ']')
+        with open(str('%s/memory_requests_period_%d.json' % (KOA_CONFIG.frontend_data_location, period)), 'w') as fd:
+            fd.write('[' + ','.join(requests_export[1]) + ']')
 
 
 def pull_k8s(api_context):
@@ -716,9 +792,9 @@ def pull_k8s(api_context):
     headers = {}
     client_cert = None
     endpoint_info = urllib.parse.urlparse(KOA_CONFIG.k8s_api_endpoint)
-    if endpoint_info.hostname != '127.0.0.1' and endpoint_info.hostname != 'localhost':
+    if KOA_CONFIG.enable_debug or (endpoint_info.hostname != '127.0.0.1' and endpoint_info.hostname != 'localhost'):
         if KOA_CONFIG.k8s_auth_token != 'NO_ENV_AUTH_TOKEN':
-            headers['Authorization'] = ('%s %s' % KOA_CONFIG.k8s_auth_token_type, KOA_CONFIG.k8s_auth_token)
+            headers['Authorization'] = '%s %s' % (KOA_CONFIG.k8s_auth_token_type, KOA_CONFIG.k8s_auth_token)
         elif KOA_CONFIG.k8s_rbac_auth_token != 'NO_ENV_TOKEN_FILE':
             headers['Authorization'] = ('Bearer %s' % KOA_CONFIG.k8s_rbac_auth_token)
         elif KOA_CONFIG.k8s_auth_username != 'NO_ENV_AUTH_USERNAME' and \
@@ -748,7 +824,7 @@ def pull_k8s(api_context):
 def create_metrics_puller():
     try:
         while True:
-            KOA_LOGGER.debug('{puller] collecting new samples')
+            KOA_LOGGER.debug('[puller] collecting new samples')
 
             KOA_CONFIG.load_rbac_auth_token()
 
